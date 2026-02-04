@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Ant Foraging Simulation (ACO)</title>
+  <style>
+    body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f3f3f3;color:#111}
+    header{background:#fff;border-bottom:1px solid #ddd;padding:10px 14px;display:flex;gap:16px;align-items:center;flex-wrap:wrap}
+    .pill{border:1px solid #ddd;background:#fafafa;border-radius:999px;padding:6px 10px;font-weight:700;font-variant-numeric:tabular-nums}
+    label{font-weight:700}
+    input[type="range"]{width:260px}
+    .wrap{height:calc(100vh - 54px);padding:12px;box-sizing:border-box}
+    .card{height:100%;background:#ececec;border:1px solid #dedede;border-radius:8px;overflow:hidden}
+    canvas{width:100%;height:100%;display:block}
+    .hint{color:#666;font-size:12px;margin-left:auto}
+  </style>
+</head>
+<body>
+<header>
+  <div style="display:flex;align-items:center;gap:10px;">
+    <label for="ants">Ants</label>
+    <input id="ants" type="range" min="10" max="600" value="120" />
+    <span class="pill" id="antsVal">120</span>
+  </div>
+  <span class="pill">Time: <span id="time">0s</span></span>
+  <span class="hint">Click to add food • Shift+Click to move nest</span>
+</header>
+
+<div class="wrap">
+  <div class="card">
+    <canvas id="cv"></canvas>
+  </div>
+</div>
+
+<script>
+(() => {
+  // -------- Canvas setup --------
+  const canvas = document.getElementById('cv');
+  const ctx = canvas.getContext('2d', { alpha:false });
+
+  function resize() {
+    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = Math.floor(rect.width * dpr);
+    canvas.height = Math.floor(rect.height * dpr);
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    initGrid(); // grid depends on canvas size
+  }
+  window.addEventListener('resize', resize);
+
+  const W = () => canvas.getBoundingClientRect().width;
+  const H = () => canvas.getBoundingClientRect().height;
+
+  // -------- UI --------
+  const antsSlider = document.getElementById('ants');
+  const antsVal = document.getElementById('antsVal');
+  const timeEl = document.getElementById('time');
+
+  // -------- Helpers --------
+  const clamp = (x,a,b)=>Math.max(a,Math.min(b,x));
+  const rand  = (a,b)=>a+Math.random()*(b-a);
+
+  // -------- World --------
+  let nest = { x: 0, y: 0, r: 18 };
+  let foods = []; // {x,y,r,amount}
+
+  // -------- Pheromone field (grid) --------
+  // We use a single scalar field. Ants deposit more when carrying food (return trip).
+  let cellSize = 6, gw = 0, gh = 0;
+  let pher = null, scratch = null;
+
+  function idx(x,y){ return y*gw + x; }
+  function worldToGrid(x,y){
+    return {
+      gx: clamp((x / cellSize) | 0, 0, gw-1),
+      gy: clamp((y / cellSize) | 0, 0, gh-1),
+    };
+  }
+
+  function initGrid(){
+    const w = W(), h = H();
+    // keep ~<=120k cells for speed
+    const targetCells = 110000;
+    cellSize = clamp(Math.sqrt((w*h)/targetCells), 4, 10);
+    gw = Math.max(40, (w / cellSize) | 0);
+    gh = Math.max(40, (h / cellSize) | 0);
+    pher = new Float32Array(gw*gh);
+    scratch = new Float32Array(gw*gh);
+  }
+
+  function clearPher(){ pher.fill(0); scratch.fill(0); }
+
+  function deposit(x,y,amount){
+    const {gx,gy} = worldToGrid(x,y);
+    const r = 2;
+    for (let yy = gy-r; yy <= gy+r; yy++){
+      if (yy<0||yy>=gh) continue;
+      for (let xx = gx-r; xx <= gx+r; xx++){
+        if (xx<0||xx>=gw) continue;
+        const d2 = (xx-gx)*(xx-gx) + (yy-gy)*(yy-gy);
+        pher[idx(xx,yy)] += amount / (1 + d2);
+      }
+    }
+  }
+
+  function sample(x,y){
+    const {gx,gy} = worldToGrid(x,y);
+    return pher[idx(gx,gy)];
+  }
+
+  function evaporateDiffuse(dt){
+    // evaporate: pher *= (1 - k*dt)
+    const k = 0.14; // per second evaporation (simple version)
+    const keep = Math.max(0, 1 - k*dt);
+
+    // light diffusion: 5-point stencil blur
+    for (let y=0; y<gh; y++){
+      for (let x=0; x<gw; x++){
+        const i = idx(x,y);
+        const c = pher[i];
+        const l = x>0    ? pher[i-1]   : c;
+        const r = x<gw-1 ? pher[i+1]   : c;
+        const u = y>0    ? pher[i-gw]  : c;
+        const d = y<gh-1 ? pher[i+gw]  : c;
+        const blurred = c*0.66 + (l+r+u+d)*0.085;
+        scratch[i] = blurred * keep;
+      }
+    }
+    const tmp = pher; pher = scratch; scratch = tmp;
+  }
+
+  // -------- Ants --------
+  let ants = [];
+  function setAntCount(n){
+    n = Math.max(1, n|0);
+    while (ants.length < n) ants.push(makeAnt());
+    while (ants.length > n) ants.pop();
+  }
+
+  function makeAnt(){
+    return {
+      x: nest.x + rand(-10,10),
+      y: nest.y + rand(-10,10),
+      ang: rand(0, Math.PI*2),
+      carrying: false,
+      jitter: rand(0.7, 1.3),
+    };
+  }
+
+  function angleTo(ax,ay,bx,by){ return Math.atan2(by-ay, bx-ax); }
+
+  function stepAnt(a, dt){
+    const speed = 120 * a.jitter;  // px/s
+    const maxTurn = 3.2 * dt;      // rad
+
+    // Randomness (simple: fixed probability)
+    const randomP = 0.32;
+
+    const ax = a.x, ay = a.y;
+
+    if (a.carrying) {
+      // Deposit pheromone while returning to nest (stronger signal)
+      deposit(ax, ay, 80 * dt);
+
+      // Head toward nest
+      const home = angleTo(ax, ay, nest.x, nest.y);
+      steer(a, home, maxTurn);
+
+      // Drop food at nest
+      const dn = Math.hypot(nest.x-ax, nest.y-ay);
+      if (dn < nest.r + 6) {
+        a.carrying = false;
+        a.ang += Math.PI + rand(-0.4,0.4);
+      }
+    } else {
+      // Check food pickup
+      for (const f of foods) {
+        if (f.amount <= 0) continue;
+        const d = Math.hypot(f.x-ax, f.y-ay);
+        if (d < f.r + 6) {
+          f.amount--;
+          a.carrying = true;
+          a.ang += Math.PI + rand(-0.4,0.4);
+          break;
+        }
+      }
+
+      if (!a.carrying) {
+        if (Math.random() < randomP) {
+          a.ang += rand(-1,1) * 2.2 * dt;
+        } else {
+          // Sense pheromone ahead/left/right, choose direction of higher pheromone
+          const senseDist = 18;
+          const senseAng = 0.55;
+
+          const fx = ax + Math.cos(a.ang) * senseDist;
+          const fy = ay + Math.sin(a.ang) * senseDist;
+          const lx = ax + Math.cos(a.ang - senseAng) * senseDist;
+          const ly = ay + Math.sin(a.ang - senseAng) * senseDist;
+          const rx = ax + Math.cos(a.ang + senseAng) * senseDist;
+          const ry = ay + Math.sin(a.ang + senseAng) * senseDist;
+
+          const pf = sample(fx,fy);
+          const pl = sample(lx,ly);
+          const pr = sample(rx,ry);
+
+          // pick max with a bit of noise
+          let target = a.ang;
+          const noise = 0.02;
+          const nf = pf + Math.random()*noise;
+          const nl = pl + Math.random()*noise;
+          const nr = pr + Math.random()*noise;
+
+          if (nl > nf && nl > nr) target = a.ang - senseAng;
+          else if (nr > nf && nr > nl) target = a.ang + senseAng;
+          else target = a.ang;
+
+          // slight attraction to nearest food if somewhat close (helps emergence)
+          let nearest=null, best=1e9;
+          for (const f of foods){
+            if (f.amount<=0) continue;
+            const d = Math.hypot(f.x-ax, f.y-ay);
+            if (d < best){ best=d; nearest=f; }
+          }
+          if (nearest && best < 260) {
+            const fa = angleTo(ax,ay,nearest.x,nearest.y);
+            target = blendAngles(target, fa, 0.18 * (1 - best/260));
+          }
+
+          steer(a, target, maxTurn);
+        }
+      }
+    }
+
+    // Move
+    a.x += Math.cos(a.ang) * speed * dt;
+    a.y += Math.sin(a.ang) * speed * dt;
+
+    // Bounce walls
+    const w=W(), h=H();
+    if (a.x < 2) { a.x=2; a.ang = Math.PI - a.ang; }
+    if (a.x > w-2) { a.x=w-2; a.ang = Math.PI - a.ang; }
+    if (a.y < 2) { a.y=2; a.ang = -a.ang; }
+    if (a.y > h-2) { a.y=h-2; a.ang = -a.ang; }
+  }
+
+  function steer(a, target, maxTurn){
+    let da = target - a.ang;
+    while (da > Math.PI) da -= Math.PI*2;
+    while (da < -Math.PI) da += Math.PI*2;
+    da = clamp(da, -maxTurn, maxTurn);
+    a.ang += da;
+  }
+
+  function blendAngles(a,b,t){
+    let d = b - a;
+    while (d > Math.PI) d -= Math.PI*2;
+    while (d < -Math.PI) d += Math.PI*2;
+    return a + d*t;
+  }
+
+  // -------- Rendering --------
+  function draw(){
+    const w=W(), h=H();
+    ctx.fillStyle = "#f0f0f0";
+    ctx.fillRect(0,0,w,h);
+
+    // Pheromone heat (blue squares)
+    let max=0;
+    for (let i=0;i<pher.length;i++) if (pher[i]>max) max=pher[i];
+    max = Math.max(max, 1e-6);
+
+    const alphaScale = 0.50;
+    for (let y=0; y<gh; y++){
+      for (let x=0; x<gw; x++){
+        const p = pher[idx(x,y)];
+        if (p < 0.05) continue;
+        const t = clamp(p/max, 0, 1);
+        ctx.globalAlpha = clamp(t*alphaScale, 0, 0.55);
+        ctx.fillStyle = "#3b60ff";
+        ctx.fillRect(x*cellSize, y*cellSize, cellSize, cellSize);
+      }
+    }
+    ctx.globalAlpha = 1;
+
+    // Nest
+    ctx.fillStyle = "#8a4b12";
+    ctx.beginPath();
+    ctx.arc(nest.x, nest.y, nest.r, 0, Math.PI*2);
+    ctx.fill();
+
+    // Food sources
+    for (const f of foods){
+      if (f.amount <= 0) continue;
+      ctx.fillStyle = "#1d7c1f";
+      ctx.beginPath();
+      ctx.arc(f.x, f.y, f.r, 0, Math.PI*2);
+      ctx.fill();
+
+      ctx.fillStyle = "#fff";
+      ctx.font = "bold 12px system-ui, sans-serif";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(String(f.amount), f.x, f.y);
+    }
+
+    // Ants
+    ctx.fillStyle = "#111";
+    for (const a of ants){
+      ctx.beginPath();
+      ctx.arc(a.x, a.y, 2.0, 0, Math.PI*2);
+      ctx.fill();
+      const hx = a.x + Math.cos(a.ang)*3.2;
+      const hy = a.y + Math.sin(a.ang)*3.2;
+      ctx.beginPath();
+      ctx.arc(hx, hy, 1.1, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  // -------- Timer --------
+  let start = performance.now();
+  function elapsedSec(){
+    return Math.floor((performance.now() - start)/1000);
+  }
+
+  // -------- Interaction --------
+  canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if (e.shiftKey) {
+      nest.x = x; nest.y = y;
+      // respawn some ants near new nest
+      for (const a of ants){
+        if (Math.random() < 0.35) { a.x = nest.x + rand(-10,10); a.y = nest.y + rand(-10,10); }
+      }
+      return;
+    }
+
+    // add a food source where clicked
+    foods.push({ x, y, r: 16, amount: Math.floor(rand(160, 520)) });
+  });
+
+  // -------- Init + loop --------
+  function init(){
+    nest.x = W()*0.5;
+    nest.y = H()*0.5;
+
+    foods = [];
+    // A few food sources by default
+    for (let i=0;i<4;i++){
+      foods.push({ x: rand(60, W()-60), y: rand(60, H()-60), r: 16, amount: Math.floor(rand(160, 520)) });
+    }
+
+    clearPher();
+    setAntCount(+antsSlider.value);
+    start = performance.now();
+  }
+
+  antsSlider.addEventListener('input', () => {
+    antsVal.textContent = antsSlider.value;
+    setAntCount(+antsSlider.value);
+  });
+
+  let last = performance.now();
+  function frame(now){
+    const dt = Math.min(0.033, (now - last)/1000);
+    last = now;
+
+    // step ants
+    for (const a of ants) stepAnt(a, dt);
+    evaporateDiffuse(dt);
+
+    // timer update
+    timeEl.textContent = `${elapsedSec()}s`;
+
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  // Boot
+  resize();
+  antsVal.textContent = antsSlider.value;
+  init();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
